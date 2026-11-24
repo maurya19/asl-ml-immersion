@@ -12,7 +12,7 @@ class PayoutEstimatorAgent(BaseAgent):
         )
         self.agent = Agent(
             name=self.name,
-            model="gemini-2.0-flash",
+            model="gemini-3.5-flash",
             description=self.description,
             instruction=(
                 "You are a payout estimation agent. Your role is to calculate "

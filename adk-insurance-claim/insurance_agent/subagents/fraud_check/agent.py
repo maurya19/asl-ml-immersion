@@ -65,7 +65,7 @@ class FraudCheckAgent(BaseAgent):
         )
         self.agent = Agent(
             name=self.name,
-            model="gemini-2.0-flash",
+            model="gemini-3.5-flash",
             description=self.description,
             instruction=(
                 "You are a fraud detection agent. Your role is to analyze "

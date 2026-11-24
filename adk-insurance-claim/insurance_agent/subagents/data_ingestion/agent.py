@@ -12,7 +12,7 @@ class DataIngestionAgent(BaseAgent):
         )
         self.agent = Agent(
             name=self.name,
-            model="gemini-2.0-flash",
+            model="gemini-3.5-flash",
             description=self.description,
             instruction=(
                 "You are a data ingestion agent. Your role is to validate and structure "
