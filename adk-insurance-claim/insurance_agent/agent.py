@@ -41,14 +41,13 @@ from typing import Dict, Any, List, Optional, Tuple, Union, Callable, Awaitable
 import logging
 import asyncio
 from typing import Dict, Any
-from pydantic import BaseModel, Field
-from typing import AsyncGenerator
-from google.adk.agents import Agent, BaseAgent as AdkBaseAgent, ParallelAgent, SequentialAgent
-from google.adk.agents.invocation_context import InvocationContext
-from google.adk.events import Event, EventActions
+from pydantic import BaseModel
+from google.adk.agents import Agent
+from google.adk.agents.context import Context
 from google.adk.runners import InMemoryRunner
-from google.genai import types
 from google.adk.tools import FunctionTool
+from google.adk.workflow import START, JoinNode, Workflow, node
+from google.genai import types
 
 # Relative imports for subagents
 from .subagents.data_ingestion import DataIngestionAgent
@@ -56,67 +55,6 @@ from .subagents.policy_validation import PolicyValidationAgent
 from .subagents.fraud_check import FraudCheckAgent
 from .subagents.payout_estimator import PayoutEstimatorAgent
 from .subagents.base_agent import ProcessingResult
-
-
-def _state_event(author: str, **updates: Any) -> Event:
-    """Build an event that writes ``updates`` into the ADK session state."""
-    return Event(author=author, actions=EventActions(state_delta=updates))
-
-
-class _WorkflowStep(AdkBaseAgent):
-    """Base for ADK workflow steps.
-
-    Each step reads its inputs from the session state and writes its outputs
-    back with a state-delta event, so the following steps can see them.
-    """
-
-    processor: Any = Field(default=None, exclude=True)
-
-
-class IngestStep(_WorkflowStep):
-    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-        result = await self.processor.data_ingestion_agent.process(ctx.session.state["claim_data"])
-        if not result.success:
-            raise ValueError(f"Data ingestion failed: {result.error}")
-        yield _state_event(self.name, ingested_claim=result.data.get("ingested_claim", {}))
-
-
-class PolicyValidationStep(_WorkflowStep):
-    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-        # PolicyValidationAgent reads the wrapped form: {"ingested_claim": {...}}
-        result = await self.processor.policy_validation_agent.process(
-            {"ingested_claim": ctx.session.state["ingested_claim"]}
-        )
-        yield _state_event(self.name, policy_validation=result.data.get("policy_validation", {}))
-
-
-class FraudCheckStep(_WorkflowStep):
-    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-        state = ctx.session.state
-        claim_data = state["claim_data"]
-        result = await self.processor.fraud_check_agent.process({
-            "ingested_claim": state["ingested_claim"],
-            "claim_data": claim_data,
-            "vehicle": claim_data.get("vehicle", {}),
-        })
-        yield _state_event(self.name, fraud_analysis=result.data.get("fraud_analysis", {}))
-
-
-class PayoutStep(_WorkflowStep):
-    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-        state = ctx.session.state
-        payout_input = {
-            key: state.get(key)
-            for key in ("claim_data", "ingested_claim", "policy_validation", "fraud_analysis")
-        }
-        result = await self.processor.payout_estimator_agent.process(payout_input)
-        if result.success:
-            yield _state_event(self.name, payout_estimation=result.data.get("payout_estimation", {}))
-        elif "claim_denied" in result.data or result.data.get("needs_manual_review"):
-            # A denial or a manual-review flag is an outcome, not a failure: record it.
-            yield _state_event(self.name, payout_estimation={"outcome": result.error, **result.data})
-        else:
-            raise ValueError(f"Payout calculation failed: {result.error}")
 
 
 class InsuranceClaimProcessor:
@@ -217,45 +155,62 @@ class InsuranceClaimProcessor:
             self.root_agent.tools = []
         self.root_agent.tools.append(process_claim_tool)
     
-    def _create_parallel_agents(self) -> ParallelAgent:
-        """Build the ParallelAgent that runs policy validation and fraud check concurrently."""
-        return ParallelAgent(
-            name="validation_and_fraud_check",
-            description="Runs policy validation and fraud check in parallel",
-            sub_agents=[
-                PolicyValidationStep(
-                    name="policy_validation",
-                    description="Verifies the claim against policy terms",
-                    processor=self,
-                ),
-                FraudCheckStep(
-                    name="fraud_check",
-                    description="Analyzes the claim for potential fraud",
-                    processor=self,
-                ),
-            ],
-        )
+    def _create_workflow(self) -> Workflow:
+        """Build the ADK Workflow for claim processing.
 
-    def _create_workflow(self) -> SequentialAgent:
-        """Build the ADK SequentialAgent for claim processing.
-
-        Order: ingest -> (policy validation || fraud check) -> payout.
+        Graph: ingest -> (policy validation || fraud check) -> join -> payout.
+        Each node reads its inputs from session state and writes its outputs
+        back to it, so the final state holds every step's result.
         """
-        return SequentialAgent(
+        processor = self
+
+        @node(name="ingest_claim_data")
+        async def ingest_claim_data(ctx: Context) -> None:
+            result = await processor.data_ingestion_agent.process(ctx.state["claim_data"])
+            if not result.success:
+                raise ValueError(f"Data ingestion failed: {result.error}")
+            ctx.state["ingested_claim"] = result.data.get("ingested_claim", {})
+
+        @node(name="policy_validation")
+        async def policy_validation(ctx: Context) -> None:
+            # PolicyValidationAgent reads the wrapped form: {"ingested_claim": {...}}
+            result = await processor.policy_validation_agent.process(
+                {"ingested_claim": ctx.state["ingested_claim"]}
+            )
+            ctx.state["policy_validation"] = result.data.get("policy_validation", {})
+
+        @node(name="fraud_check")
+        async def fraud_check(ctx: Context) -> None:
+            claim_data = ctx.state["claim_data"]
+            result = await processor.fraud_check_agent.process({
+                "ingested_claim": ctx.state["ingested_claim"],
+                "claim_data": claim_data,
+                "vehicle": claim_data.get("vehicle", {}),
+            })
+            ctx.state["fraud_analysis"] = result.data.get("fraud_analysis", {})
+
+        @node(name="calculate_payout")
+        async def calculate_payout(ctx: Context) -> None:
+            payout_input = {
+                key: ctx.state.get(key)
+                for key in ("claim_data", "ingested_claim", "policy_validation", "fraud_analysis")
+            }
+            result = await processor.payout_estimator_agent.process(payout_input)
+            if result.success:
+                ctx.state["payout_estimation"] = result.data.get("payout_estimation", {})
+            elif "claim_denied" in result.data or result.data.get("needs_manual_review"):
+                # A denial or a manual-review flag is an outcome, not a failure: record it.
+                ctx.state["payout_estimation"] = {"outcome": result.error, **result.data}
+            else:
+                raise ValueError(f"Payout calculation failed: {result.error}")
+
+        validation_join = JoinNode(name="validation_join")
+        return Workflow(
             name="claim_processing_workflow",
-            description="Processes insurance claims through multiple validation steps",
-            sub_agents=[
-                IngestStep(
-                    name="ingest_claim_data",
-                    description="Ingests and validates claim data",
-                    processor=self,
-                ),
-                self._create_parallel_agents(),
-                PayoutStep(
-                    name="calculate_payout",
-                    description="Calculates the final payout amount",
-                    processor=self,
-                ),
+            edges=[
+                (START, ingest_claim_data),
+                (ingest_claim_data, (policy_validation, fraud_check)),
+                ((policy_validation, fraud_check), validation_join, calculate_payout),
             ],
         )
 
