@@ -42,7 +42,12 @@ import logging
 import asyncio
 from typing import Dict, Any
 from pydantic import BaseModel, Field
-from google.adk.agents import Agent, ParallelAgent, SequentialAgent
+from typing import AsyncGenerator
+from google.adk.agents import Agent, BaseAgent as AdkBaseAgent, ParallelAgent, SequentialAgent
+from google.adk.agents.invocation_context import InvocationContext
+from google.adk.events import Event, EventActions
+from google.adk.runners import InMemoryRunner
+from google.genai import types
 from google.adk.tools import FunctionTool
 
 # Relative imports for subagents
@@ -51,6 +56,68 @@ from .subagents.policy_validation import PolicyValidationAgent
 from .subagents.fraud_check import FraudCheckAgent
 from .subagents.payout_estimator import PayoutEstimatorAgent
 from .subagents.base_agent import ProcessingResult
+
+
+def _state_event(author: str, **updates: Any) -> Event:
+    """Build an event that writes ``updates`` into the ADK session state."""
+    return Event(author=author, actions=EventActions(state_delta=updates))
+
+
+class _WorkflowStep(AdkBaseAgent):
+    """Base for ADK workflow steps.
+
+    Each step reads its inputs from the session state and writes its outputs
+    back with a state-delta event, so the following steps can see them.
+    """
+
+    processor: Any = Field(default=None, exclude=True)
+
+
+class IngestStep(_WorkflowStep):
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        result = await self.processor.data_ingestion_agent.process(ctx.session.state["claim_data"])
+        if not result.success:
+            raise ValueError(f"Data ingestion failed: {result.error}")
+        yield _state_event(self.name, ingested_claim=result.data.get("ingested_claim", {}))
+
+
+class PolicyValidationStep(_WorkflowStep):
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        # PolicyValidationAgent reads the wrapped form: {"ingested_claim": {...}}
+        result = await self.processor.policy_validation_agent.process(
+            {"ingested_claim": ctx.session.state["ingested_claim"]}
+        )
+        yield _state_event(self.name, policy_validation=result.data.get("policy_validation", {}))
+
+
+class FraudCheckStep(_WorkflowStep):
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        state = ctx.session.state
+        claim_data = state["claim_data"]
+        result = await self.processor.fraud_check_agent.process({
+            "ingested_claim": state["ingested_claim"],
+            "claim_data": claim_data,
+            "vehicle": claim_data.get("vehicle", {}),
+        })
+        yield _state_event(self.name, fraud_analysis=result.data.get("fraud_analysis", {}))
+
+
+class PayoutStep(_WorkflowStep):
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        state = ctx.session.state
+        payout_input = {
+            key: state.get(key)
+            for key in ("claim_data", "ingested_claim", "policy_validation", "fraud_analysis")
+        }
+        result = await self.processor.payout_estimator_agent.process(payout_input)
+        if result.success:
+            yield _state_event(self.name, payout_estimation=result.data.get("payout_estimation", {}))
+        elif "claim_denied" in result.data or result.data.get("needs_manual_review"):
+            # A denial or a manual-review flag is an outcome, not a failure: record it.
+            yield _state_event(self.name, payout_estimation={"outcome": result.error, **result.data})
+        else:
+            raise ValueError(f"Payout calculation failed: {result.error}")
+
 
 class InsuranceClaimProcessor:
     """
@@ -92,7 +159,7 @@ class InsuranceClaimProcessor:
         # Create the root agent that will coordinate the workflow
         self.root_agent = Agent(
             name="insurance_claim_processor",
-            model="gemini-2.0-flash",
+            model="gemini-3.5-flash",
             description="Coordinates the insurance claim processing workflow",
             instruction=(
                 "You are an automated insurance claim processor. Your role is to process claims through the workflow.\n\n"
@@ -150,156 +217,65 @@ class InsuranceClaimProcessor:
             self.root_agent.tools = []
         self.root_agent.tools.append(process_claim_tool)
     
-    async def _create_parallel_agents(self, context: Dict[str, Any]) -> ParallelAgent:
-        """Create and configure parallel agents for validation and fraud check.
-        
-        Args:
-            context: The current processing context with claim data
-            
-        Returns:
-            A configured ParallelAgent instance
-        """
-        # Create a parallel agent to run validation and fraud check concurrently
-        parallel_agent = ParallelAgent(
+    def _create_parallel_agents(self) -> ParallelAgent:
+        """Build the ParallelAgent that runs policy validation and fraud check concurrently."""
+        return ParallelAgent(
             name="validation_and_fraud_check",
-            description="Runs policy validation and fraud check in parallel"
+            description="Runs policy validation and fraud check in parallel",
+            sub_agents=[
+                PolicyValidationStep(
+                    name="policy_validation",
+                    description="Verifies the claim against policy terms",
+                    processor=self,
+                ),
+                FraudCheckStep(
+                    name="fraud_check",
+                    description="Analyzes the claim for potential fraud",
+                    processor=self,
+                ),
+            ],
         )
-        
-        # Add policy validation agent
-        @parallel_agent.add_agent(name="policy_validation")
-        async def policy_validation_agent() -> Dict[str, Any]:
-            result = await self.policy_validation_agent.process(context)
-            return {"success": result.success, "data": result.data}
-            
-        # Add fraud check agent
-        @parallel_agent.add_agent(name="fraud_check")
-        async def fraud_check_agent() -> Dict[str, Any]:
-            result = await self.fraud_check_agent.process(context)
-            return {"success": result.success, "data": result.data}
-            
-        return parallel_agent
-        
+
     def _create_workflow(self) -> SequentialAgent:
-        """Create the sequential workflow for claim processing.
-        
-        This method defines the sequence of steps for processing an insurance claim,
-        including both sequential and parallel processing steps.
-        
-        Returns:
-            A configured SequentialAgent instance that processes claims through
-            multiple validation steps including parallel execution of policy
-            validation and fraud check.
+        """Build the ADK SequentialAgent for claim processing.
+
+        Order: ingest -> (policy validation || fraud check) -> payout.
         """
-        # Store a reference to self for use in agent methods
-        processor = self
-        
-        # Create a custom agent for each step in the workflow
-        class IngestAgent(Agent):
-            processor: Any = Field(default=None, exclude=True)
-            
-            def __init__(self, **data):
-                # Set the processor before calling parent's __init__
-                super().__init__(**{k: v for k, v in data.items() if k != 'processor'})
-                self.processor = processor
-                
-            async def _run_async_impl(self, context):
-                result = await self.processor.data_ingestion_agent.process(context["claim_data"])
-                if not result.success:
-                    raise ValueError(f"Data ingestion failed: {result.error}")
-                context["ingested_claim"] = result.data.get("ingested_claim", {})
-                return context
-        
-        class ValidationAgent(Agent):
-            processor: Any = Field(default=None, exclude=True)
-            
-            def __init__(self, **data):
-                # Set the processor before calling parent's __init__
-                super().__init__(**{k: v for k, v in data.items() if k != 'processor'})
-                self.processor = processor
-                
-            async def _run_async_impl(self, context):
-                # Create and run parallel validations
-                parallel_agent = await self.processor._create_parallel_agents(context)
-                results = await parallel_agent.run()
-                
-                # Process results with better error handling
-                policy_result = results.get("policy_validation", {})
-                fraud_result = results.get("fraud_check", {})
-                
-                # Log raw results for debugging
-                logging.info(f"[DEBUG] Raw Policy Result: {policy_result}")
-                logging.info(f"[DEBUG] Raw Fraud Result: {fraud_result}")
-                
-                # Check for errors with more detailed messages
-                if not policy_result:
-                    raise ValueError("Policy validation result is empty")
-                if not fraud_result:
-                    raise ValueError("Fraud check result is empty")
-                
-                # Extract validation data with defaults
-                policy_data = policy_result.get("data", {})
-                fraud_data = fraud_result.get("data", {})
-                
-                # Set default values if validation data is empty
-                context["policy_validation"] = {
-                    "is_valid": policy_data.get("is_valid", True),
-                    "claim_type_covered": policy_data.get("claim_type_covered", True),
-                    **policy_data.get("policy_validation", {})  # Preserve any additional data
-                }
-                
-                context["fraud_analysis"] = {
-                    "risk_score": fraud_data.get("risk_score", 0.0),
-                    "needs_review": fraud_data.get("needs_review", False),
-                    "fraud_indicators": fraud_data.get("fraud_indicators", []),
-                    **fraud_data.get("fraud_analysis", {})  # Preserve any additional data
-                }
-                return context
-        
-        class PayoutAgent(Agent):
-            processor: Any = Field(default=None, exclude=True)
-            
-            def __init__(self, **data):
-                # Set the processor before calling parent's __init__
-                super().__init__(**{k: v for k, v in data.items() if k != 'processor'})
-                self.processor = processor
-                
-            async def _run_async_impl(self, context):
-                result = await self.processor.payout_estimator_agent.process(context)
-                if not result.success:
-                    raise ValueError(f"Payout calculation failed: {result.error}")
-                context["payout_estimation"] = result.data.get("payout_estimation", {})
-                return context
-        
-        # Create the sequential agent with sub-agents
-        workflow = SequentialAgent(
+        return SequentialAgent(
             name="claim_processing_workflow",
-            description="Processes insurance claims through multiple validation steps"
+            description="Processes insurance claims through multiple validation steps",
+            sub_agents=[
+                IngestStep(
+                    name="ingest_claim_data",
+                    description="Ingests and validates claim data",
+                    processor=self,
+                ),
+                self._create_parallel_agents(),
+                PayoutStep(
+                    name="calculate_payout",
+                    description="Calculates the final payout amount",
+                    processor=self,
+                ),
+            ],
         )
-        
-        # Create and configure sub-agents
-        ingest_agent = IngestAgent(
-            name="ingest_claim_data",
-            description="Ingests and validates claim data"
+
+    async def run_workflow(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Run the ADK workflow for one claim and return the final session state."""
+        app_name, user_id = "insurance_claims", "claims_processor"
+        claim_data = dict(claim_data)
+        if "claim_id" not in claim_data:
+            claim_data["claim_id"] = f"CLAIM-{str(uuid.uuid4())[:8].upper()}"
+        runner = InMemoryRunner(agent=self.workflow, app_name=app_name)
+        session = await runner.session_service.create_session(
+            app_name=app_name, user_id=user_id, state={"claim_data": claim_data}
         )
-        
-        validation_agent = ValidationAgent(
-            name="run_validations",
-            description="Runs policy validation and fraud check in parallel"
+        trigger = types.Content(role="user", parts=[types.Part(text="Process the claim in session state.")])
+        async for _ in runner.run_async(user_id=user_id, session_id=session.id, new_message=trigger):
+            pass
+        final = await runner.session_service.get_session(
+            app_name=app_name, user_id=user_id, session_id=session.id
         )
-        
-        payout_agent = PayoutAgent(
-            name="calculate_payout",
-            description="Calculates the final payout amount"
-        )
-        
-        # Set the sub_agents attribute using the proper method if available
-        if hasattr(workflow, 'set_sub_agents'):
-            workflow.set_sub_agents([ingest_agent, validation_agent, payout_agent])
-        else:
-            # Fallback to direct attribute access if set_sub_agents doesn't exist
-            workflow.sub_agents = [ingest_agent, validation_agent, payout_agent]
-        
-        return workflow
+        return dict(final.state)
 
     def _create_initial_context(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create the initial context for the workflow.
