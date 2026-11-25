@@ -216,7 +216,7 @@ class InsuranceClaimProcessor:
         # Root agent that hands every claim to the workflow via the tool
         self.root_agent = Agent(
             name="insurance_claim_processor",
-            model="gemini-3.5-flash",
+            model="gemini-2.5-flash",
             description="Coordinates the insurance claim processing workflow",
             instruction=ROOT_INSTRUCTION,
             tools=[FunctionTool(process_claim)],
